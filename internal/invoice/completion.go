@@ -51,20 +51,21 @@ type DefaultInvoiceCompletionService struct {
 
 // ChatGPTResponse represents the structured response from ChatGPT
 type ChatGPTResponse struct {
-	Type           string `json:"type"`
-	TypeConfidence string `json:"type_confidence"` // Accept as string, convert later
-	TypeReasoning  string `json:"type_reasoning"`
-	Vendor         string `json:"vendor,omitempty"`
-	Customer       string `json:"customer,omitempty"`
-	InvoiceNumber  string `json:"invoice_number,omitempty"`
-	IssueDate      string `json:"issue_date,omitempty"`
-	DueDate        string `json:"due_date,omitempty"`
-	NetAmount      string `json:"net_amount,omitempty"`
-	VATAmount      string `json:"vat_amount,omitempty"`
-	GrossAmount    string `json:"gross_amount,omitempty"`
-	Currency       string `json:"currency,omitempty"`
-	Reference      string `json:"reference,omitempty"`
-	Description    string `json:"description,omitempty"`
+	Type              string `json:"type"`
+	TypeConfidence    string `json:"type_confidence"` // Accept as string, convert later
+	TypeReasoning     string `json:"type_reasoning"`
+	AccountingSummary string `json:"accounting_summary,omitempty"` // German accounting summary
+	Vendor            string `json:"vendor,omitempty"`
+	Customer          string `json:"customer,omitempty"`
+	InvoiceNumber     string `json:"invoice_number,omitempty"`
+	IssueDate         string `json:"issue_date,omitempty"`
+	DueDate           string `json:"due_date,omitempty"`
+	NetAmount         string `json:"net_amount,omitempty"`
+	VATAmount         string `json:"vat_amount,omitempty"`
+	GrossAmount       string `json:"gross_amount,omitempty"`
+	Currency          string `json:"currency,omitempty"`
+	Reference         string `json:"reference,omitempty"`
+	Description       string `json:"description,omitempty"`
 }
 
 // NewInvoiceCompletionService creates service with dependencies from environment
@@ -313,9 +314,9 @@ func (s *DefaultInvoiceCompletionService) extractInvoiceFromText(ctx context.Con
 			Str("response", content).
 			Msg("Received ChatGPT response")
 
-		// Parse JSON response
-		var chatGPTResponse ChatGPTResponse
-		if err := json.Unmarshal([]byte(content), &chatGPTResponse); err != nil {
+		// Parse JSON response with robust confidence handling
+		var rawResponse map[string]interface{}
+		if err := json.Unmarshal([]byte(content), &rawResponse); err != nil {
 			lastErr = fmt.Errorf("failed to parse ChatGPT JSON response: %w", err)
 			s.log.Warn().
 				Err(err).
@@ -323,6 +324,38 @@ func (s *DefaultInvoiceCompletionService) extractInvoiceFromText(ctx context.Con
 				Int("attempt", attempt).
 				Msg("Failed to parse ChatGPT response, retrying")
 			continue
+		}
+
+		// Convert to our struct with confidence normalization
+		chatGPTResponse := ChatGPTResponse{
+			Type:              getString(rawResponse, "type"),
+			TypeReasoning:     getString(rawResponse, "type_reasoning"),
+			AccountingSummary: getString(rawResponse, "accounting_summary"),
+			Vendor:            getString(rawResponse, "vendor"),
+			Customer:          getString(rawResponse, "customer"),
+			InvoiceNumber:     getString(rawResponse, "invoice_number"),
+			IssueDate:         getString(rawResponse, "issue_date"),
+			DueDate:           getString(rawResponse, "due_date"),
+			NetAmount:         getString(rawResponse, "net_amount"),
+			VATAmount:         getString(rawResponse, "vat_amount"),
+			GrossAmount:       getString(rawResponse, "gross_amount"),
+			Currency:          getString(rawResponse, "currency"),
+			Reference:         getString(rawResponse, "reference"),
+			Description:       getString(rawResponse, "description"),
+		}
+
+		// Handle confidence as either string or number
+		if conf := rawResponse["type_confidence"]; conf != nil {
+			switch v := conf.(type) {
+			case string:
+				chatGPTResponse.TypeConfidence = v
+			case float64:
+				chatGPTResponse.TypeConfidence = fmt.Sprintf("%.1f", v)
+			case int:
+				chatGPTResponse.TypeConfidence = fmt.Sprintf("%d", v)
+			default:
+				chatGPTResponse.TypeConfidence = "0.5" // fallback
+			}
 		}
 
 		// Validate type field is present and valid
@@ -345,6 +378,7 @@ func (s *DefaultInvoiceCompletionService) extractInvoiceFromText(ctx context.Con
 			Str("determined_type", chatGPTResponse.Type).
 			Float32("type_confidence", typeConfidence).
 			Str("reasoning", chatGPTResponse.TypeReasoning).
+			Str("accounting_summary", chatGPTResponse.AccountingSummary).
 			Int("attempt", attempt).
 			Msg("Successfully extracted invoice data from ChatGPT")
 
@@ -356,7 +390,7 @@ func (s *DefaultInvoiceCompletionService) extractInvoiceFromText(ctx context.Con
 
 // getSystemPrompt returns the system prompt for ChatGPT that emphasizes invoice type determination
 func (s *DefaultInvoiceCompletionService) getSystemPrompt() string {
-	return fmt.Sprintf(`You are analyzing invoices for %s. Your primary task is to determine the invoice type and extract missing information.
+	return fmt.Sprintf(`You are analyzing invoices for %s. Your primary task is to determine the invoice type, extract missing information, and create a German accounting summary.
 
 CRITICAL TASK: Determine if this invoice is PAYABLE or RECEIVABLE
 - PAYABLE: This is a bill TO our company (we owe money to the vendor)
@@ -369,6 +403,16 @@ Look for these indicators:
 - If payment should be made TO us → RECEIVABLE
 - Check bank account details ownership
 - Look for "Remit To" vs "Bill To" sections
+
+ACCOUNTING SUMMARY: Create a German prose summary describing ONLY what goods/services are being billed:
+- Focus on WHAT was purchased or what service was provided
+- Do NOT mention amounts, dates, or invoice details
+- Include a suggested German accounting category (Kontierungsvorschlag)
+- Examples:
+  * "IT-Equipment bestehend aus 5 Laptops und 10 Monitoren für Arbeitsplatzausstattung, Kontierung: IT-Hardware/Anlagegüter"
+  * "Büromaterialbestellung mit Druckerpapier, Toner und Schreibwaren, Kontierung: Bürobedarf"
+  * "Monatliche Cloud-Hosting Gebühren für Produktionsserver, Kontierung: IT-Infrastruktur/laufende Kosten"
+  * "Beratungsleistungen für SAP-Migration, Kontierung: Externe Dienstleistungen/Projekte"
 
 Company Context:
 - Our company: %s
@@ -415,6 +459,9 @@ func (s *DefaultInvoiceCompletionService) buildCompletionPrompt(ocrText string, 
 		prompt.WriteString(`  "type_confidence": "confidence score 0-1",` + "\n")
 		prompt.WriteString(`  "type_reasoning": "brief explanation of determination",` + "\n")
 	}
+
+	// Always include accounting summary (it's always useful for German accounting)
+	prompt.WriteString(`  "accounting_summary": "German description of goods/services and Kontierungsvorschlag",` + "\n")
 
 	// Add other missing fields
 	for _, field := range missingFields {
@@ -553,6 +600,15 @@ func (s *DefaultInvoiceCompletionService) mergeCompletionResults(invoice *models
 		confidence["description"] = 0.8
 	}
 
+	// Accounting Summary (always apply if provided)
+	if response.AccountingSummary != "" {
+		invoice.AccountingSummary = response.AccountingSummary
+		confidence["accounting_summary"] = 0.8
+		s.log.Info().
+			Str("summary", response.AccountingSummary).
+			Msg("German accounting summary generated")
+	}
+
 	// Update timestamps
 	invoice.UpdatedAt = time.Now()
 
@@ -627,6 +683,16 @@ func contains(slice []string, item string) bool {
 		}
 	}
 	return false
+}
+
+// getString safely extracts a string value from a map[string]interface{}
+func getString(m map[string]interface{}, key string) string {
+	if value, exists := m[key]; exists && value != nil {
+		if str, ok := value.(string); ok {
+			return str
+		}
+	}
+	return ""
 }
 
 // Helper functions for environment parsing

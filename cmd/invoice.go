@@ -86,11 +86,12 @@ type InvoiceData struct {
 	VATAmount     int64      `json:"vat_amount_cents"`
 	GrossAmount   int64      `json:"gross_amount_cents"`
 	Currency      string     `json:"currency"`
-	IsPaid        bool       `json:"is_paid"`
-	Reference     string     `json:"reference,omitempty"`
-	Description   string     `json:"description,omitempty"`
-	CreatedAt     time.Time  `json:"created_at"`
-	UpdatedAt     time.Time  `json:"updated_at"`
+	IsPaid            bool       `json:"is_paid"`
+	Reference         string     `json:"reference,omitempty"`
+	Description       string     `json:"description,omitempty"`
+	AccountingSummary string     `json:"accounting_summary,omitempty"`
+	CreatedAt         time.Time  `json:"created_at"`
+	UpdatedAt         time.Time  `json:"updated_at"`
 }
 
 // ProcessingMetadata contains information about the processing operation
@@ -435,11 +436,12 @@ func convertToInvoiceData(modelInvoice *models.Invoice) *InvoiceData {
 		VATAmount:     modelInvoice.VATAmount,
 		GrossAmount:   modelInvoice.GrossAmount,
 		Currency:      modelInvoice.Currency,
-		IsPaid:        modelInvoice.IsPaid,
-		Reference:     modelInvoice.Reference,
-		Description:   modelInvoice.Description,
-		CreatedAt:     modelInvoice.CreatedAt,
-		UpdatedAt:     modelInvoice.UpdatedAt,
+		IsPaid:            modelInvoice.IsPaid,
+		Reference:         modelInvoice.Reference,
+		Description:       modelInvoice.Description,
+		AccountingSummary: modelInvoice.AccountingSummary,
+		CreatedAt:         modelInvoice.CreatedAt,
+		UpdatedAt:         modelInvoice.UpdatedAt,
 	}
 
 	// Handle potentially zero time values

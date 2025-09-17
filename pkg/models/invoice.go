@@ -27,8 +27,9 @@ type Invoice struct {
 	IsPaid bool // Payment status flag
 
 	// Optional metadata
-	Reference   string    // External reference number
-	Description string    // Brief description/notes
-	CreatedAt   time.Time // Record creation timestamp
-	UpdatedAt   time.Time // Last update timestamp
+	Reference        string    // External reference number
+	Description      string    // Brief description/notes
+	AccountingSummary string   // German accounting summary describing goods/services and suggested categorization
+	CreatedAt        time.Time // Record creation timestamp
+	UpdatedAt        time.Time // Last update timestamp
 }
