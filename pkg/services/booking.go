@@ -15,6 +15,9 @@ type BookingService interface {
 
 	// GenerateBookingFromPDF processes PDF, extracts invoice data, and generates booking
 	GenerateBookingFromPDF(ctx context.Context, pdfData io.Reader) (*DATEVBooking, *models.Invoice, error)
+
+	// GenerateBookingFromPDFWithType processes PDF with manual type override
+	GenerateBookingFromPDFWithType(ctx context.Context, pdfData io.Reader, typeOverride string) (*DATEVBooking, *models.Invoice, error)
 }
 
 // DATEVBooking represents a complete DATEV accounting entry

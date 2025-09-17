@@ -49,6 +49,10 @@ Required environment variables:
   # Show detailed explanations
   tools datev invoice.pdf --verbose
 
+  # Force invoice type (wenn ChatGPT die Richtung falsch erkennt)
+  tools datev invoice.pdf --type payable     # Eingangsrechnung
+  tools datev invoice.pdf --type receivable  # Ausgangsrechnung
+
   # Use different chart of accounts (future feature)
   tools datev invoice.pdf --skr 04`,
 	Args: cobra.ExactArgs(1),
@@ -59,6 +63,7 @@ func init() {
 	rootCmd.AddCommand(datevCmd)
 
 	datevCmd.Flags().String("skr", "03", "Kontenrahmen (03=SKR03, 04=SKR04)")
+	datevCmd.Flags().String("type", "", "Rechnungstyp (payable=Eingangsrechnung, receivable=Ausgangsrechnung)")
 	datevCmd.Flags().Bool("json", false, "Output as JSON format")
 	datevCmd.Flags().Bool("verbose", false, "Show detailed explanation and reasoning")
 }
@@ -68,6 +73,7 @@ func runDatev(cmd *cobra.Command, args []string) error {
 
 	// Get flags
 	skr, _ := cmd.Flags().GetString("skr")
+	invoiceType, _ := cmd.Flags().GetString("type")
 	jsonOutput, _ := cmd.Flags().GetBool("json")
 	verbose, _ := cmd.Flags().GetBool("verbose")
 
@@ -76,6 +82,7 @@ func runDatev(cmd *cobra.Command, args []string) error {
 	log.Info().
 		Str("file", pdfPath).
 		Str("skr", skr).
+		Str("type", invoiceType).
 		Bool("json", jsonOutput).
 		Bool("verbose", verbose).
 		Msg("Starting DATEV booking generation")
@@ -83,6 +90,14 @@ func runDatev(cmd *cobra.Command, args []string) error {
 	// Validate SKR parameter
 	if skr != "03" {
 		return fmt.Errorf("only SKR03 is currently supported, got: %s", skr)
+	}
+
+	// Validate invoice type parameter if provided
+	if invoiceType != "" {
+		invoiceType = strings.ToUpper(invoiceType)
+		if invoiceType != "PAYABLE" && invoiceType != "RECEIVABLE" {
+			return fmt.Errorf("invalid invoice type: %s (must be 'payable' or 'receivable')", invoiceType)
+		}
 	}
 
 	// Validate and get file info
@@ -123,7 +138,14 @@ func runDatev(cmd *cobra.Command, args []string) error {
 
 	// Generate booking from PDF
 	startTime := time.Now()
-	booking, invoice, err := bookingService.GenerateBookingFromPDF(ctx, pdfFile)
+	var booking *services.DATEVBooking
+	var invoice *models.Invoice
+
+	if invoiceType != "" {
+		booking, invoice, err = bookingService.GenerateBookingFromPDFWithType(ctx, pdfFile, invoiceType)
+	} else {
+		booking, invoice, err = bookingService.GenerateBookingFromPDF(ctx, pdfFile)
+	}
 	if err != nil {
 		return handleDatevError(err, log)
 	}

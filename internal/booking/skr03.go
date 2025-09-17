@@ -154,6 +154,68 @@ func (s *SKR03BookingService) GenerateBookingFromPDF(ctx context.Context, pdfDat
 	return booking, completedInvoice, nil
 }
 
+// GenerateBookingFromPDFWithType processes PDF, extracts invoice data, and generates booking with type override
+func (s *SKR03BookingService) GenerateBookingFromPDFWithType(ctx context.Context, pdfData io.Reader, typeOverride string) (*services.DATEVBooking, *models.Invoice, error) {
+	const op = "GenerateBookingFromPDFWithType"
+
+	s.log.Info().
+		Str("type_override", typeOverride).
+		Msg("Processing PDF for DATEV booking generation with type override")
+
+	// Buffer the PDF data since we need to read it multiple times
+	pdfBytes, err := io.ReadAll(pdfData)
+	if err != nil {
+		return nil, nil, fmt.Errorf("%s: failed to read PDF data: %w", op, err)
+	}
+
+	// Create Document AI processor
+	processor, err := invoice.NewDocumentAIInvoiceProcessor(ctx)
+	if err != nil {
+		return nil, nil, fmt.Errorf("%s: failed to create Document AI processor: %w", op, err)
+	}
+
+	// Extract invoice data with Document AI
+	partialInvoice, err := processor.ProcessInvoice(ctx, bytes.NewReader(pdfBytes))
+	if err != nil {
+		return nil, nil, fmt.Errorf("%s: Document AI processing failed: %w", op, err)
+	}
+
+	s.log.Info().
+		Str("invoice_number", partialInvoice.InvoiceNumber).
+		Str("vendor", partialInvoice.Vendor).
+		Msg("Invoice extracted with Document AI")
+
+	// Complete invoice with missing fields but override the type
+	completedInvoice, err := s.invoiceCompletion.CompleteInvoice(ctx, partialInvoice, bytes.NewReader(pdfBytes))
+	if err != nil {
+		s.log.Warn().Err(err).Msg("Invoice completion failed, using Document AI result only")
+		completedInvoice = partialInvoice
+	}
+
+	// Override the type if provided
+	if typeOverride != "" {
+		originalType := completedInvoice.Type
+		completedInvoice.Type = typeOverride
+		s.log.Info().
+			Str("original_type", originalType).
+			Str("override_type", typeOverride).
+			Msg("Invoice type overridden by user")
+	}
+
+	s.log.Info().
+		Str("type", completedInvoice.Type).
+		Str("accounting_summary", completedInvoice.AccountingSummary).
+		Msg("Invoice completion finished with type override")
+
+	// Generate booking from completed invoice
+	booking, err := s.GenerateBooking(ctx, completedInvoice)
+	if err != nil {
+		return nil, nil, fmt.Errorf("%s: booking generation failed: %w", op, err)
+	}
+
+	return booking, completedInvoice, nil
+}
+
 // generateBookingWithChatGPT uses ChatGPT to generate booking information
 func (s *SKR03BookingService) generateBookingWithChatGPT(ctx context.Context, invoiceJSON string, invoice *models.Invoice) (*ChatGPTBookingResponse, error) {
 	const op = "generateBookingWithChatGPT"
