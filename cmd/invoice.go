@@ -22,8 +22,10 @@ import (
 var invoiceCmd = &cobra.Command{
 	Use:   "invoice [pdf-file]",
 	Short: "Extract structured invoice data from PDF using Google Document AI",
-	Long: `Process a PDF invoice using Google Document AI's specialized invoice parser
-to extract structured data such as amounts, dates, vendor information, and more.
+	Long: `Process PDF invoices using Google Document AI.
+
+Use --complete flag to fill missing fields (especially PAYABLE/RECEIVABLE type)
+using OCR and ChatGPT after Document AI processing.
 
 This command uses Google Document AI's invoice processor which is specifically 
 trained to understand invoice formats and extract key business information with
@@ -35,18 +37,25 @@ Required environment variables:
   GOOGLE_CREDENTIALS - Inline JSON credentials string
   GOOGLE_CLOUD_PROJECT - Your Google Cloud project ID
   GOOGLE_CLOUD_LOCATION - Processing location (us, eu, etc.)
-  DOCUMENT_AI_PROCESSOR_ID - Your Document AI invoice processor ID`,
-	Example: `  # Extract invoice data to stdout (JSON format)
+  DOCUMENT_AI_PROCESSOR_ID - Your Document AI invoice processor ID
+  
+Additional for --complete flag:
+  OPENAI_API_KEY - OpenAI API key for completion service
+  COMPANY_NAME - Your company name for invoice type determination`,
+	Example: `  # Basic Document AI processing only
   tools invoice invoice.pdf
 
+  # Document AI + completion service for missing fields  
+  tools invoice invoice.pdf --complete
+
   # Save extracted data to JSON file
-  tools invoice invoice.pdf -o invoice-data.json
+  tools invoice invoice.pdf -o invoice-data.json --complete
 
   # Include confidence scores for each extracted field
-  tools invoice invoice.pdf --confidence
+  tools invoice invoice.pdf --confidence --complete
 
   # Process with custom timeout
-  tools invoice large-invoice.pdf --timeout 120`,
+  tools invoice large-invoice.pdf --timeout 120 --complete`,
 	Args: cobra.ExactArgs(1),
 	RunE: runInvoice,
 }
@@ -98,6 +107,7 @@ func init() {
 
 	invoiceCmd.Flags().StringP("output", "o", "", "Output file path (default: stdout)")
 	invoiceCmd.Flags().Bool("confidence", false, "Include confidence scores in output")
+	invoiceCmd.Flags().Bool("complete", false, "Complete missing invoice fields using OCR and AI after Document AI processing")
 	invoiceCmd.Flags().Int("timeout", 120, "Processing timeout in seconds")
 }
 
@@ -107,6 +117,7 @@ func runInvoice(cmd *cobra.Command, args []string) error {
 	// Get flags
 	outputPath, _ := cmd.Flags().GetString("output")
 	includeConfidence, _ := cmd.Flags().GetBool("confidence")
+	completeFlag, _ := cmd.Flags().GetBool("complete")
 	timeoutSecs, _ := cmd.Flags().GetInt("timeout")
 
 	pdfPath := args[0]
@@ -115,6 +126,7 @@ func runInvoice(cmd *cobra.Command, args []string) error {
 		Str("file", pdfPath).
 		Str("output", outputPath).
 		Bool("confidence", includeConfidence).
+		Bool("complete", completeFlag).
 		Int("timeout", timeoutSecs).
 		Msg("Starting invoice processing")
 
@@ -154,27 +166,78 @@ func runInvoice(cmd *cobra.Command, args []string) error {
 		Int64("size", fileInfo.Size()).
 		Msg("Processing invoice PDF with Document AI")
 
-	// Process invoice
+	// Process invoice with Document AI first
 	startTime := time.Now()
-	var invoiceData *InvoiceData
+	var modelInvoice *models.Invoice
 	var confidence map[string]float32
 
 	if includeConfidence {
-		modelInvoice, conf, err := processor.ProcessInvoiceWithConfidence(ctx, pdfFile)
+		var err error
+		modelInvoice, confidence, err = processor.ProcessInvoiceWithConfidence(ctx, pdfFile)
 		if err != nil {
 			return handleInvoiceError(err, log)
 		}
-		invoiceData = convertToInvoiceData(modelInvoice)
-		confidence = conf
 	} else {
-		modelInvoice, err := processor.ProcessInvoice(ctx, pdfFile)
+		var err error
+		modelInvoice, err = processor.ProcessInvoice(ctx, pdfFile)
 		if err != nil {
 			return handleInvoiceError(err, log)
 		}
-		invoiceData = convertToInvoiceData(modelInvoice)
+		confidence = make(map[string]float32)
+	}
+
+	// Check if completion flag is set
+	if completeFlag {
+		log.Info().Msg("Running completion service to fill missing fields")
+
+		// Initialize completion service
+		completionService, err := invoice.NewInvoiceCompletionService(ctx)
+		if err != nil {
+			log.Warn().Err(err).Msg("Failed to initialize completion service, using Document AI result only")
+		} else {
+			// Reopen PDF for completion service
+			pdfFile2, err := os.Open(pdfPath)
+			if err != nil {
+				log.Warn().Err(err).Msg("Failed to reopen PDF for completion, using Document AI result only")
+			} else {
+				defer func() {
+					if closeErr := pdfFile2.Close(); closeErr != nil {
+						log.Warn().Err(closeErr).Msg("Failed to close PDF file for completion")
+					}
+				}()
+
+				// Run the Document AI result through completion service
+				if includeConfidence {
+					completedInvoice, completionConfidence, err := completionService.CompleteInvoiceWithConfidence(ctx, modelInvoice, pdfFile2)
+					if err != nil {
+						log.Warn().Err(err).Msg("Completion service failed, using Document AI result")
+					} else {
+						modelInvoice = completedInvoice
+						// Merge confidence scores
+						for k, v := range completionConfidence {
+							confidence[k] = v
+						}
+						log.Info().
+							Str("type", modelInvoice.Type).
+							Msg("Invoice completion successful - type determined")
+					}
+				} else {
+					completedInvoice, err := completionService.CompleteInvoice(ctx, modelInvoice, pdfFile2)
+					if err != nil {
+						log.Warn().Err(err).Msg("Completion service failed, using Document AI result")
+					} else {
+						modelInvoice = completedInvoice
+						log.Info().
+							Str("type", modelInvoice.Type).
+							Msg("Invoice completion successful - type determined")
+					}
+				}
+			}
+		}
 	}
 
 	processingDuration := time.Since(startTime)
+	invoiceData := convertToInvoiceData(modelInvoice)
 
 	log.Info().
 		Str("invoice_number", invoiceData.InvoiceNumber).

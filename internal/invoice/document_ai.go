@@ -55,7 +55,7 @@ func NewDocumentAIInvoiceProcessor(ctx context.Context) (InvoiceProcessor, error
 
 	// Create Document AI client with regional endpoint
 	var clientOptions []option.ClientOption
-	
+
 	// Set regional endpoint if not us-central1
 	if config.Location != "" && config.Location != "us" {
 		endpoint := fmt.Sprintf("%s-documentai.googleapis.com:443", config.Location)
@@ -201,8 +201,8 @@ func (p *DocumentAIInvoiceProcessor) handleProcessingError(op string, err error)
 // extractInvoiceData converts Document AI entities to Invoice model.
 func (p *DocumentAIInvoiceProcessor) extractInvoiceData(doc *documentaipb.Document) (*models.Invoice, map[string]float32, error) {
 	invoice := &models.Invoice{
-		Type:      "PAYABLE", // Default to payable (incoming invoice)
-		Currency:  "EUR",     // Default currency
+		Type:      "",    // Default to payable (incoming invoice)
+		Currency:  "EUR", // Default currency
 		CreatedAt: time.Now(),
 		UpdatedAt: time.Now(),
 	}
