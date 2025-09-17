@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -12,7 +13,9 @@ import (
 	documentai "cloud.google.com/go/documentai/apiv1"
 	"cloud.google.com/go/documentai/apiv1/documentaipb"
 	"google.golang.org/api/option"
+	"github.com/rs/zerolog"
 
+	"tools/internal/logger"
 	"tools/pkg/models"
 )
 
@@ -28,6 +31,7 @@ const (
 type DocumentAIInvoiceProcessor struct {
 	client *documentai.DocumentProcessorClient
 	config DocumentAIConfig
+	log    zerolog.Logger
 }
 
 // NewDocumentAIInvoiceProcessor creates processor with credentials from environment.
@@ -81,6 +85,7 @@ func NewDocumentAIInvoiceProcessor(ctx context.Context) (InvoiceProcessor, error
 	return &DocumentAIInvoiceProcessor{
 		client: client,
 		config: config,
+		log:    logger.WithComponent("document-ai"),
 	}, nil
 }
 
@@ -89,6 +94,7 @@ func NewDocumentAIInvoiceProcessorWithConfig(config DocumentAIConfig, client *do
 	return &DocumentAIInvoiceProcessor{
 		client: client,
 		config: config,
+		log:    logger.WithComponent("document-ai"),
 	}
 }
 
@@ -217,6 +223,12 @@ func (p *DocumentAIInvoiceProcessor) extractInvoiceData(doc *documentaipb.Docume
 
 		confidence[entityType] = conf
 
+		p.log.Debug().
+			Str("entity_type", entityType).
+			Str("value", value).
+			Float32("confidence", conf).
+			Msg("Processing Document AI entity")
+
 		switch entityType {
 		case "invoice_id", "invoice_number":
 			invoice.InvoiceNumber = value
@@ -234,15 +246,42 @@ func (p *DocumentAIInvoiceProcessor) extractInvoiceData(doc *documentaipb.Docume
 			}
 		case "net_amount", "subtotal_amount":
 			if amount, err := p.extractMoneyValue(entity); err == nil {
+				p.log.Debug().
+					Int64("amount", amount).
+					Str("raw_value", value).
+					Msg("Extracted net amount from Document AI")
 				invoice.NetAmount = amount
+			} else {
+				p.log.Warn().
+					Err(err).
+					Str("raw_value", value).
+					Msg("Failed to extract net amount from Document AI")
 			}
 		case "total_tax_amount", "vat_amount":
 			if amount, err := p.extractMoneyValue(entity); err == nil {
+				p.log.Debug().
+					Int64("amount", amount).
+					Str("raw_value", value).
+					Msg("Extracted VAT amount from Document AI")
 				invoice.VATAmount = amount
+			} else {
+				p.log.Warn().
+					Err(err).
+					Str("raw_value", value).
+					Msg("Failed to extract VAT amount from Document AI")
 			}
 		case "total_amount", "gross_amount":
 			if amount, err := p.extractMoneyValue(entity); err == nil {
+				p.log.Debug().
+					Int64("amount", amount).
+					Str("raw_value", value).
+					Msg("Extracted gross amount from Document AI")
 				invoice.GrossAmount = amount
+			} else {
+				p.log.Warn().
+					Err(err).
+					Str("raw_value", value).
+					Msg("Failed to extract gross amount from Document AI")
 			}
 		case "currency":
 			if value != "" {
@@ -253,6 +292,17 @@ func (p *DocumentAIInvoiceProcessor) extractInvoiceData(doc *documentaipb.Docume
 		}
 	}
 
+	// Apply invoice number fallback strategies if no number was extracted
+	if invoice.InvoiceNumber == "" {
+		if fallbackNumber := p.extractInvoiceNumberFallback(doc); fallbackNumber != "" {
+			invoice.InvoiceNumber = fallbackNumber
+			confidence["invoice_number_fallback"] = 0.6 // Lower confidence for fallback
+			p.log.Info().
+				Str("fallback_number", fallbackNumber).
+				Msg("Invoice number extracted using fallback strategy")
+		}
+	}
+
 	// Generate ID if not present
 	if invoice.ID == "" {
 		invoice.ID = p.generateInvoiceID(invoice)
@@ -260,6 +310,15 @@ func (p *DocumentAIInvoiceProcessor) extractInvoiceData(doc *documentaipb.Docume
 
 	// Calculate missing amounts if possible
 	p.calculateMissingAmounts(invoice)
+
+	// Log final extracted amounts
+	p.log.Info().
+		Str("invoice_number", invoice.InvoiceNumber).
+		Int64("net_amount", invoice.NetAmount).
+		Int64("vat_amount", invoice.VATAmount).
+		Int64("gross_amount", invoice.GrossAmount).
+		Str("currency", invoice.Currency).
+		Msg("Document AI extraction completed")
 
 	// Validate critical fields
 	if err := p.validateInvoice(invoice); err != nil {
@@ -328,21 +387,49 @@ func (p *DocumentAIInvoiceProcessor) extractMoneyValue(entity *documentaipb.Docu
 		return 0, fmt.Errorf("empty amount value")
 	}
 
-	// Clean the amount string - handle German decimal format (comma as decimal separator)
-	amountStr = strings.ReplaceAll(amountStr, ",", ".")
-	amountStr = strings.ReplaceAll(amountStr, " ", "")
-	amountStr = strings.ReplaceAll(amountStr, "€", "")
-	amountStr = strings.ReplaceAll(amountStr, "$", "")
-	amountStr = strings.ReplaceAll(amountStr, "EUR", "")
-	amountStr = strings.ReplaceAll(amountStr, "USD", "")
-
-	// Parse as float
-	amount, err := strconv.ParseFloat(amountStr, 64)
+	// Use the same robust German number parsing as Invoice Completion
+	amount, err := p.parseAmount(amountStr)
 	if err != nil {
 		return 0, fmt.Errorf("unable to parse amount: %s", entity.MentionText)
 	}
 
-	// Convert to cents
+	return amount, nil
+}
+
+// parseAmount parses amount string handling both German and English formats
+func (p *DocumentAIInvoiceProcessor) parseAmount(amountStr string) (int64, error) {
+	// Clean the amount string
+	cleaned := strings.TrimSpace(amountStr)
+	cleaned = strings.ReplaceAll(cleaned, " ", "")
+	cleaned = strings.ReplaceAll(cleaned, "€", "")
+	cleaned = strings.ReplaceAll(cleaned, "$", "")
+	cleaned = strings.ReplaceAll(cleaned, "EUR", "")
+	cleaned = strings.ReplaceAll(cleaned, "USD", "")
+	
+	// Handle German number format (7.303,08 -> 7303.08)
+	if strings.Contains(cleaned, ",") {
+		// If there's both . and , assume German format (. = thousands, , = decimal)
+		if strings.Contains(cleaned, ".") && strings.Contains(cleaned, ",") {
+			// Remove thousands separators (dots)
+			cleaned = strings.ReplaceAll(cleaned, ".", "")
+			// Replace decimal separator (comma) with dot
+			cleaned = strings.ReplaceAll(cleaned, ",", ".")
+		} else if strings.Contains(cleaned, ",") {
+			// Only comma, could be decimal separator
+			// Count digits after comma to determine if it's decimal
+			parts := strings.Split(cleaned, ",")
+			if len(parts) == 2 && len(parts[1]) <= 2 {
+				// Likely decimal separator (e.g., "1234,50")
+				cleaned = strings.ReplaceAll(cleaned, ",", ".")
+			}
+		}
+	}
+
+	amount, err := strconv.ParseFloat(cleaned, 64)
+	if err != nil {
+		return 0, fmt.Errorf("unable to parse amount: %s (cleaned: %s)", amountStr, cleaned)
+	}
+
 	return int64(amount * 100), nil
 }
 
@@ -438,4 +525,101 @@ func (p *DocumentAIInvoiceProcessor) normalizeCurrency(currency string) string {
 		// Otherwise default to EUR
 		return "EUR"
 	}
+}
+
+// extractInvoiceNumberFallback implements fallback strategies for invoice number extraction
+func (p *DocumentAIInvoiceProcessor) extractInvoiceNumberFallback(doc *documentaipb.Document) string {
+	// Strategy 1: Search in line item descriptions for HORNBACH patterns
+	for _, entity := range doc.Entities {
+		if entity.Type == "line_item" || entity.Type == "line_item/description" {
+			text := strings.TrimSpace(entity.MentionText)
+			if invoiceNum := p.extractInvoiceNumberFromText(text); invoiceNum != "" {
+				p.log.Debug().
+					Str("source", "line_item").
+					Str("text", text).
+					Str("number", invoiceNum).
+					Msg("Found invoice number in line item")
+				return invoiceNum
+			}
+		}
+	}
+	
+	// Strategy 2: Search in all OCR text for known patterns
+	if doc.Text != "" {
+		if invoiceNum := p.extractInvoiceNumberFromText(doc.Text); invoiceNum != "" {
+			p.log.Debug().
+				Str("source", "full_text").
+				Str("number", invoiceNum).
+				Msg("Found invoice number in full OCR text")
+			return invoiceNum
+		}
+	}
+	
+	// Strategy 3: Search in entity properties and sub-entities
+	for _, entity := range doc.Entities {
+		// Check if entity has properties that might contain invoice numbers
+		if entity.Properties != nil {
+			for _, prop := range entity.Properties {
+				text := strings.TrimSpace(prop.MentionText)
+				if invoiceNum := p.extractInvoiceNumberFromText(text); invoiceNum != "" {
+					p.log.Debug().
+						Str("source", "entity_property").
+						Str("property_type", prop.Type).
+						Str("text", text).
+						Str("number", invoiceNum).
+						Msg("Found invoice number in entity property")
+					return invoiceNum
+				}
+			}
+		}
+	}
+	
+	return ""
+}
+
+// extractInvoiceNumberFromText searches for invoice number patterns in text
+func (p *DocumentAIInvoiceProcessor) extractInvoiceNumberFromText(text string) string {
+	
+	// Common German invoice number patterns
+	patterns := []string{
+		// HORNBACH specific patterns
+		`(?i)(?:rechnung|belegnr|beleg)[\s\-:\.]*(\d{8,}|\d{4,}\-\d+|\d+\.\d+)`,
+		`(?i)(?:rechnungsnr|rg\.?nr|rg\.?)[\s\-:\.]*(\d{8,}|\d{4,}\-\d+|\d+\.\d+)`,
+		`(?i)(?:invoice|inv)[\s\-:\.]*(?:no|nr|number)[\s\-:\.]*(\d{8,}|\d{4,}\-\d+|\d+\.\d+)`,
+		
+		// Generic patterns
+		`(?i)(?:^|\s)(?:nr|no|number)[\s\-:\.]*(\d{6,})`,
+		`(?i)(?:dokument|document)[\s\-:\.]*(?:nr|no)[\s\-:\.]*(\d{6,})`,
+		`(?i)(?:^|\s)(\d{8,})(?:\s|$)`, // Standalone 8+ digit numbers
+		
+		// Date-based invoice numbers (common in Germany)
+		`(?i)(\d{4,}\-\d{4,}\-\d+)`, // Format: YYYY-MMMM-XXX
+		`(?i)(\d{6,}\.\d+)`,          // Format: YYYYMM.XXX
+	}
+	
+	for _, pattern := range patterns {
+		re := regexp.MustCompile(pattern)
+		if matches := re.FindStringSubmatch(text); len(matches) > 1 {
+			candidate := strings.TrimSpace(matches[1])
+			// Validate candidate (basic sanity checks)
+			if len(candidate) >= 6 && len(candidate) <= 20 {
+				p.log.Debug().
+					Str("pattern", pattern).
+					Str("candidate", candidate).
+					Str("source_text", text[:min(50, len(text))]).
+					Msg("Invoice number pattern matched")
+				return candidate
+			}
+		}
+	}
+	
+	return ""
+}
+
+// min returns the minimum of two integers
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }

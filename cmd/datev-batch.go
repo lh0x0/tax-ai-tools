@@ -295,8 +295,30 @@ func processSinglePDF(ctx context.Context, pdfPath string, invoiceType string, b
 	result.Booking = booking
 	result.Status = "success"
 
-	// Check for potential warnings
+	// Check for potential warnings that indicate data quality issues
+	hasWarnings := false
+	
+	// Warning: Missing amounts (both net and VAT are zero)
 	if invoice.NetAmount == 0 && invoice.VATAmount == 0 {
+		hasWarnings = true
+	}
+	
+	// Warning: Missing critical invoice information
+	if invoice.InvoiceNumber == "" {
+		hasWarnings = true
+	}
+	
+	// Warning: No amount information at all
+	if invoice.GrossAmount == 0 {
+		hasWarnings = true
+	}
+	
+	// Warning: Truncated booking text (check if it ends with "...")
+	if strings.HasSuffix(booking.BookingText, "...") {
+		hasWarnings = true
+	}
+	
+	if hasWarnings {
 		result.Status = "warning"
 	}
 

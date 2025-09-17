@@ -390,19 +390,31 @@ func (s *DefaultInvoiceCompletionService) extractInvoiceFromText(ctx context.Con
 
 // getSystemPrompt returns the system prompt for ChatGPT that emphasizes invoice type determination
 func (s *DefaultInvoiceCompletionService) getSystemPrompt() string {
-	return fmt.Sprintf(`You are analyzing invoices for %s. Your primary task is to determine the invoice type, extract missing information, and create a German accounting summary.
+	return fmt.Sprintf(`Du analysierst Rechnungen für %s. Deine wichtigste Aufgabe ist die korrekte Bestimmung des Rechnungstyps.
 
-CRITICAL TASK: Determine if this invoice is PAYABLE or RECEIVABLE
-- PAYABLE: This is a bill TO our company (we owe money to the vendor)
-- RECEIVABLE: This is an invoice FROM our company (customer owes us money)
+KRITISCH: Bestimme ob diese Rechnung PAYABLE oder RECEIVABLE ist:
 
-Look for these indicators:
-- If "Bill To" or "Invoice To" matches our company → PAYABLE
-- If "From" or "Vendor" matches our company → RECEIVABLE  
-- If payment instructions are TO another company → PAYABLE
-- If payment should be made TO us → RECEIVABLE
-- Check bank account details ownership
-- Look for "Remit To" vs "Bill To" sections
+** PAYABLE (Eingangsrechnung) = WIR MÜSSEN ZAHLEN **
+- Rechnung VON einem Lieferanten AN unser Unternehmen
+- Wir sind der Käufer/Rechnungsempfänger
+- Zahlungsanweisungen: Geld soll AN den Lieferanten/Verkäufer
+- Bankverbindung gehört dem Verkäufer/Lieferanten
+- Typische Begriffe: "Rechnung an", "Invoice To", "Bill To" + unser Firmenname
+- Lieferant/Verkäufer ist NICHT unser Unternehmen
+
+** RECEIVABLE (Ausgangsrechnung) = WIR BEKOMMEN GELD **
+- Rechnung VON unserem Unternehmen AN einen Kunden
+- Wir sind der Verkäufer/Rechnungssteller
+- Zahlungsanweisungen: Geld soll AN unser Unternehmen
+- Bankverbindung gehört uns
+- Typische Begriffe: "From" + unser Firmenname, wir sind der Absender
+- Kunde ist NICHT unser Unternehmen
+
+ENTSCHEIDUNGSHILFEN:
+1. Wer stellt die Rechnung? (From/Absender) → Wenn wir = RECEIVABLE
+2. Wer soll zahlen? (To/Empfänger) → Wenn wir = PAYABLE  
+3. Wessen Bankdaten stehen drauf? → Wenn unsere = RECEIVABLE
+4. Deutsche Begriffe: "Lieferant", "Anbieter", "Verkäufer" → meist PAYABLE für uns
 
 ACCOUNTING SUMMARY: Create a German prose summary describing ONLY what goods/services are being billed:
 - Focus on WHAT was purchased or what service was provided
@@ -433,34 +445,53 @@ IMPORTANT: Return ONLY valid JSON with NO trailing commas.
 func (s *DefaultInvoiceCompletionService) buildCompletionPrompt(ocrText string, missingFields []string, partialInvoice *models.Invoice) string {
 	var prompt strings.Builder
 
-	prompt.WriteString("Analyze this invoice and extract the missing information:\n\n")
+	prompt.WriteString("Analysiere diese Rechnung und extrahiere die fehlenden Informationen:\n\n")
 
-	// Current invoice data for context
-	prompt.WriteString("Current invoice data:\n")
+	// Current invoice data for context with type hints
+	prompt.WriteString("Bereits extrahierte Daten:\n")
 	if partialInvoice.Vendor != "" {
-		prompt.WriteString(fmt.Sprintf("Vendor: %s\n", partialInvoice.Vendor))
+		prompt.WriteString(fmt.Sprintf("Vendor/Lieferant: %s\n", partialInvoice.Vendor))
+		// Type hint: If we already have a vendor, this is likely PAYABLE
+		if contains(missingFields, "type") {
+			prompt.WriteString("HINWEIS: Da bereits ein Vendor/Lieferant erkannt wurde, ist dies wahrscheinlich eine PAYABLE Rechnung (Eingangsrechnung)\n")
+		}
 	}
 	if partialInvoice.Customer != "" {
-		prompt.WriteString(fmt.Sprintf("Customer: %s\n", partialInvoice.Customer))
+		prompt.WriteString(fmt.Sprintf("Customer/Kunde: %s\n", partialInvoice.Customer))
+		// Type hint: If we already have a customer, this is likely RECEIVABLE  
+		if contains(missingFields, "type") {
+			prompt.WriteString("HINWEIS: Da bereits ein Customer/Kunde erkannt wurde, ist dies wahrscheinlich eine RECEIVABLE Rechnung (Ausgangsrechnung)\n")
+		}
 	}
 	if partialInvoice.InvoiceNumber != "" {
-		prompt.WriteString(fmt.Sprintf("Invoice Number: %s\n", partialInvoice.InvoiceNumber))
+		prompt.WriteString(fmt.Sprintf("Rechnungsnummer: %s\n", partialInvoice.InvoiceNumber))
 	}
 	if partialInvoice.GrossAmount > 0 {
-		prompt.WriteString(fmt.Sprintf("Gross Amount: %.2f %s\n", float64(partialInvoice.GrossAmount)/100, partialInvoice.Currency))
+		prompt.WriteString(fmt.Sprintf("Bruttobetrag: %.2f %s\n", float64(partialInvoice.GrossAmount)/100, partialInvoice.Currency))
+	}
+
+	// Add company context for type determination
+	if contains(missingFields, "type") {
+		prompt.WriteString(fmt.Sprintf("\nFIRMEN-KONTEXT für Typ-Bestimmung:\n"))
+		prompt.WriteString(fmt.Sprintf("Unser Unternehmen: %s\n", s.config.CompanyName))
+		if len(s.config.CompanyAliases) > 0 {
+			prompt.WriteString(fmt.Sprintf("Unsere Aliases: %s\n", strings.Join(s.config.CompanyAliases, ", ")))
+		}
+		prompt.WriteString("→ Wenn unser Name im 'Bill To'/'Rechnung an' steht = PAYABLE (wir zahlen)\n")
+		prompt.WriteString("→ Wenn unser Name im 'From'/'Von' steht = RECEIVABLE (wir bekommen Geld)\n\n")
 	}
 
 	prompt.WriteString("\nOCR Text:\n")
 	prompt.WriteString(ocrText)
 
-	prompt.WriteString("\n\nReturn JSON with these fields (include only missing fields):\n")
+	prompt.WriteString("\n\nGib JSON zurück mit diesen Feldern (nur fehlende Felder):\n")
 	prompt.WriteString("{\n")
 
 	// Always include type since it's critical and rarely provided by Document AI
 	if contains(missingFields, "type") {
-		prompt.WriteString(`  "type": "PAYABLE or RECEIVABLE (REQUIRED)",` + "\n")
-		prompt.WriteString(`  "type_confidence": "confidence score 0-1",` + "\n")
-		prompt.WriteString(`  "type_reasoning": "brief explanation of determination",` + "\n")
+		prompt.WriteString(`  "type": "PAYABLE oder RECEIVABLE (ERFORDERLICH - siehe Entscheidungshilfen oben)",` + "\n")
+		prompt.WriteString(`  "type_confidence": "Konfidenz-Score 0-1 (0.9+ für eindeutige Indikatoren)",` + "\n")
+		prompt.WriteString(`  "type_reasoning": "Deutsche Begründung der Typ-Bestimmung mit konkreten Textstellen",` + "\n")
 	}
 
 	// Always include accounting summary (it's always useful for German accounting)
@@ -495,7 +526,8 @@ func (s *DefaultInvoiceCompletionService) buildCompletionPrompt(ocrText string, 
 	}
 
 	prompt.WriteString("}\n\n")
-	prompt.WriteString("CRITICAL: Ensure the JSON has NO trailing comma after the last field. Check your JSON syntax carefully!")
+	prompt.WriteString("WICHTIG: Stelle sicher dass das JSON KEINE trailing comma nach dem letzten Feld hat. Prüfe die JSON-Syntax sorgfältig!\n")
+	prompt.WriteString("AUSSCHLIESSLICH gültiges JSON ohne Text davor oder danach!")
 
 	return prompt.String()
 }
@@ -664,12 +696,22 @@ func (s *DefaultInvoiceCompletionService) validateCompletedInvoice(invoice *mode
 	}
 
 	// Ensure we have basic required fields
-	if invoice.InvoiceNumber == "" {
-		return fmt.Errorf("invoice number is still missing after completion")
+	// Note: Invoice number is not strictly required for certain document types
+	// (e.g., membership fees, exam fees, etc.)
+	
+	// Check for valid amounts - allow negative amounts for credit notes/refunds
+	if invoice.GrossAmount == 0 && invoice.NetAmount == 0 && invoice.VATAmount == 0 {
+		// All amounts are zero - likely no amount information found
+		return fmt.Errorf("no amount information found after completion")
 	}
-
-	if invoice.GrossAmount <= 0 {
-		return fmt.Errorf("gross amount is still missing or invalid after completion")
+	
+	// Allow negative amounts for credit notes, refunds, returns
+	if invoice.GrossAmount < 0 || invoice.NetAmount < 0 {
+		s.log.Info().
+			Int64("gross_amount", invoice.GrossAmount).
+			Int64("net_amount", invoice.NetAmount).
+			Str("summary", invoice.AccountingSummary).
+			Msg("Detected credit note or refund with negative amounts")
 	}
 
 	// Calculate missing amounts if we have enough information

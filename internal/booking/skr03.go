@@ -140,6 +140,37 @@ func (s *SKR03BookingService) GenerateBookingFromPDF(ctx context.Context, pdfDat
 		completedInvoice = partialInvoice
 	}
 
+	// Validate and reconcile amounts between Document AI and ChatGPT
+	validation := invoice.NewAmountValidation()
+	documentAISource := &invoice.AmountSource{
+		NetAmount:   partialInvoice.NetAmount,
+		VATAmount:   partialInvoice.VATAmount,
+		GrossAmount: partialInvoice.GrossAmount,
+		Source:      "document_ai",
+		Confidence:  0.8, // Default confidence for Document AI
+	}
+	chatGPTSource := &invoice.AmountSource{
+		NetAmount:   completedInvoice.NetAmount,
+		VATAmount:   completedInvoice.VATAmount,
+		GrossAmount: completedInvoice.GrossAmount,
+		Source:      "chatgpt",
+		Confidence:  0.7, // Default confidence for ChatGPT
+	}
+
+	validationResult := validation.ValidateAndReconcileAmounts(documentAISource, chatGPTSource, completedInvoice)
+	
+	// Use validated amounts
+	completedInvoice = validationResult.FinalAmounts
+	
+	// Log validation results
+	if len(validationResult.Warnings) > 0 {
+		s.log.Warn().
+			Strs("amount_warnings", validationResult.Warnings).
+			Bool("has_discrepancy", validationResult.HasDiscrepancy).
+			Float64("max_discrepancy_pct", validationResult.MaxDiscrepancy).
+			Msg("Amount validation completed with warnings")
+	}
+
 	s.log.Info().
 		Str("type", completedInvoice.Type).
 		Str("accounting_summary", completedInvoice.AccountingSummary).
@@ -190,6 +221,40 @@ func (s *SKR03BookingService) GenerateBookingFromPDFWithType(ctx context.Context
 	if err != nil {
 		s.log.Warn().Err(err).Msg("Invoice completion failed, using Document AI result only")
 		completedInvoice = partialInvoice
+	}
+
+	// Validate and reconcile amounts between Document AI and ChatGPT
+	validation := invoice.NewAmountValidation()
+	documentAISource := &invoice.AmountSource{
+		NetAmount:   partialInvoice.NetAmount,
+		VATAmount:   partialInvoice.VATAmount,
+		GrossAmount: partialInvoice.GrossAmount,
+		Source:      "document_ai",
+		Confidence:  0.8, // Default confidence for Document AI
+	}
+	chatGPTSource := &invoice.AmountSource{
+		NetAmount:   completedInvoice.NetAmount,
+		VATAmount:   completedInvoice.VATAmount,
+		GrossAmount: completedInvoice.GrossAmount,
+		Source:      "chatgpt",
+		Confidence:  0.7, // Default confidence for ChatGPT
+	}
+
+	validationResult := validation.ValidateAndReconcileAmounts(documentAISource, chatGPTSource, completedInvoice)
+	
+	// Use validated amounts
+	completedInvoice = validationResult.FinalAmounts
+	
+	// Log validation results
+	if len(validationResult.Warnings) > 0 {
+		s.log.Warn().
+			Strs("amount_warnings", validationResult.Warnings).
+			Bool("has_discrepancy", validationResult.HasDiscrepancy).
+			Float64("max_discrepancy_pct", validationResult.MaxDiscrepancy).
+			Msg("Amount validation completed with warnings")
+	} else {
+		s.log.Info().
+			Msg("Amount validation completed successfully")
 	}
 
 	// Override the type if provided
@@ -379,9 +444,15 @@ func (s *SKR03BookingService) validateBookingResponse(response *ChatGPTBookingRe
 		return fmt.Errorf("invalid credit account format: %s (must be 4-digit SKR03 account)", response.CreditAccount)
 	}
 
-	// Validate booking text length
+	// Validate and truncate booking text if necessary
 	if len(response.BookingText) > 60 {
-		return fmt.Errorf("booking text too long: %d characters (max 60)", len(response.BookingText))
+		originalText := response.BookingText
+		response.BookingText = response.BookingText[:57] + "..."
+		s.log.Warn().
+			Str("original_text", originalText).
+			Str("truncated_text", response.BookingText).
+			Int("original_length", len(originalText)).
+			Msg("Booking text truncated to fit DATEV 60-character limit")
 	}
 
 	return nil
