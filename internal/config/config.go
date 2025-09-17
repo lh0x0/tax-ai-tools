@@ -3,6 +3,8 @@ package config
 import (
 	"fmt"
 	"os"
+
+	"tools/internal/logger"
 )
 
 type Config struct {
@@ -28,6 +30,12 @@ type Config struct {
 
 	// Chart of Accounts Configuration
 	ChartOfAccounts string
+
+	// Logging Configuration
+	LogLevel      string
+	LogFormat     string
+	LogTimeFormat string
+	LogOutput     string
 }
 
 func Load() (*Config, error) {
@@ -45,6 +53,10 @@ func Load() (*Config, error) {
 		GCSSourceFolder:           getEnv("GCS_SOURCE_FOLDER", ""),
 		GCSOutputFolder:           getEnv("GCS_OUTPUT_FOLDER", ""),
 		ChartOfAccounts:           getEnv("CHART_OF_ACCOUNTS", "SKR04"),
+		LogLevel:                  getEnv("LOG_LEVEL", "info"),
+		LogFormat:                 getEnv("LOG_FORMAT", "console"),
+		LogTimeFormat:             getEnv("LOG_TIME_FORMAT", "2006-01-02T15:04:05Z07:00"),
+		LogOutput:                 getEnv("LOG_OUTPUT", "stdout"),
 	}
 
 	if err := config.validate(); err != nil {
@@ -74,6 +86,16 @@ func (c *Config) validate() error {
 		return fmt.Errorf("GOOGLE_SHEET_URL is required")
 	}
 	return nil
+}
+
+// GetLoggerConfig returns a logger configuration from the main config
+func (c *Config) GetLoggerConfig() logger.LogConfig {
+	return logger.LogConfig{
+		Level:      c.LogLevel,
+		Format:     c.LogFormat,
+		TimeFormat: c.LogTimeFormat,
+		Output:     c.LogOutput,
+	}
 }
 
 func getEnv(key, defaultValue string) string {

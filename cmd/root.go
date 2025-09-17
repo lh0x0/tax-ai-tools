@@ -5,6 +5,7 @@ import (
 	"os"
 
 	"github.com/spf13/cobra"
+	"tools/internal/logger"
 )
 
 var version = "1.0.0"
@@ -19,13 +20,23 @@ This application is built with Go and Cobra, making it easy to extend
 with additional subcommands as needed.`,
 	Version: version,
 	Run: func(cmd *cobra.Command, args []string) {
+		log := logger.WithComponent("root")
+		log.Info().
+			Str("version", version).
+			Msg("Tools CLI executed")
+		
 		fmt.Println("Welcome to Tools CLI!")
 		fmt.Println("Use --help to see available commands and options.")
 	},
 }
 
 func Execute() {
+	log := logger.WithComponent("cmd")
+	
 	if err := rootCmd.Execute(); err != nil {
+		log.Error().
+			Err(err).
+			Msg("Command execution failed")
 		fmt.Fprintf(os.Stderr, "Error executing command: %v\n", err)
 		os.Exit(1)
 	}
