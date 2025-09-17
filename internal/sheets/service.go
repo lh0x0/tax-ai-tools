@@ -410,3 +410,24 @@ func (s *Service) normalizeCurrency(currency string) string {
 		return "EUR"
 	}
 }
+
+// ReadRange reads values from a specified range in the spreadsheet
+func (s *Service) ReadRange(ctx context.Context, rangeSpec string) ([][]interface{}, error) {
+	const op = "ReadRange"
+
+	s.log.Debug().
+		Str("range", rangeSpec).
+		Msg("Reading range from spreadsheet")
+
+	resp, err := s.sheetsService.Spreadsheets.Values.Get(s.spreadsheetID, rangeSpec).Context(ctx).Do()
+	if err != nil {
+		return nil, fmt.Errorf("%s: failed to read range %s: %w", op, rangeSpec, err)
+	}
+
+	s.log.Debug().
+		Int("rows", len(resp.Values)).
+		Str("range", rangeSpec).
+		Msg("Successfully read range from spreadsheet")
+
+	return resp.Values, nil
+}
