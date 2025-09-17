@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"math"
+	"sort"
 	"strings"
 	"time"
 
@@ -95,17 +96,21 @@ func (s *ChatGPTReconciliationService) ReconcileAll(ctx context.Context, invoice
 		candidates := s.findCandidateTransactions(invoice, filteredTransactions, usedTransactionIndices)
 		
 		if len(candidates) == 0 {
-			s.log.Debug().
+			s.log.Info().
 				Str("invoice_number", invoice.InvoiceNumber).
-				Msg("No candidate transactions found for invoice")
+				Str("counterparty", invoice.GetCounterParty()).
+				Float64("amount", invoice.GrossAmount).
+				Msg("Processing invoice: No candidate transactions found")
 			result.UnmatchedInvoices = append(result.UnmatchedInvoices, invoice)
 			continue
 		}
 
-		s.log.Debug().
-			Int("candidates", len(candidates)).
+		s.log.Info().
 			Str("invoice_number", invoice.InvoiceNumber).
-			Msg("Found candidate transactions")
+			Str("counterparty", invoice.GetCounterParty()).
+			Float64("amount", invoice.GrossAmount).
+			Int("candidates", len(candidates)).
+			Msgf("Processing invoice %s: Found %d candidate transactions", invoice.InvoiceNumber, len(candidates))
 
 		// Use ChatGPT to match this invoice with candidates
 		matchResult, err := s.matchInvoiceWithChatGPT(ctx, invoice, candidates)
@@ -136,9 +141,13 @@ func (s *ChatGPTReconciliationService) ReconcileAll(ctx context.Context, invoice
 				Str("counterparty", invoice.GetCounterParty()).
 				Float64("invoice_amount", invoice.GrossAmount).
 				Float64("transaction_amount", matchedTransaction.Amount).
+				Time("transaction_date", matchedTransaction.Date).
 				Float64("confidence", matchResult.Confidence).
 				Str("reason", matchResult.Reason).
-				Msg("Successfully matched invoice with transaction")
+				Msgf("ChatGPT matched invoice %s with transaction from %s (confidence: %.2f)", 
+					invoice.InvoiceNumber, 
+					matchedTransaction.Date.Format("02.01.2006"), 
+					matchResult.Confidence)
 		} else {
 			result.UnmatchedInvoices = append(result.UnmatchedInvoices, invoice)
 			s.log.Debug().
@@ -168,10 +177,12 @@ func (s *ChatGPTReconciliationService) ReconcileAll(ctx context.Context, invoice
 	return result, nil
 }
 
-// TransactionCandidate represents a transaction candidate with its original index
+// TransactionCandidate represents a transaction candidate with its original index and scoring
 type TransactionCandidate struct {
 	Transaction   reconciliation.BankTransaction
 	OriginalIndex int
+	Score         float64 // Higher score = better match (amount precision + date proximity)
+	DaysDiff      int     // Days difference between invoice and transaction
 }
 
 // filterTransactionsByCutoff filters transactions to only include those before the cutoff date
@@ -185,11 +196,11 @@ func (s *ChatGPTReconciliationService) filterTransactionsByCutoff(transactions [
 	return filtered
 }
 
-// findCandidateTransactions finds transactions that could potentially match an invoice based on amount
+// findCandidateTransactions finds transactions that could potentially match an invoice based on amount and date
 func (s *ChatGPTReconciliationService) findCandidateTransactions(invoice reconciliation.InvoiceRow, transactions []reconciliation.BankTransaction, usedIndices map[int]bool) []TransactionCandidate {
 	var candidates []TransactionCandidate
 	
-	// Convert invoice amount to cents for precise comparison
+	// Convert invoice amount to cents for precise comparison (German format: 1.234,56 -> 123456 cents)
 	invoiceAmountCents := int64(math.Round(invoice.GrossAmount * 100))
 	tolerance := int64(math.Round(math.Abs(invoice.GrossAmount) * 0.01 * 100)) // 1% tolerance in cents
 	
@@ -198,49 +209,104 @@ func (s *ChatGPTReconciliationService) findCandidateTransactions(invoice reconci
 		Int64("invoice_amount_cents", invoiceAmountCents).
 		Int64("tolerance_cents", tolerance).
 		Str("invoice_type", invoice.Type).
-		Msg("Searching for candidate transactions")
+		Time("invoice_date", invoice.Date).
+		Msg("Searching for candidate transactions with intelligent filtering")
 
 	for i, transaction := range transactions {
-		// Skip already matched transactions
+		// Skip already matched transactions to avoid double-matching
 		if usedIndices[i] {
 			continue
 		}
 		
-		// Convert transaction amount to cents
+		// Convert transaction amount to cents for precise comparison
 		transactionAmountCents := int64(math.Round(transaction.Amount * 100))
 		
 		// Determine expected transaction direction based on invoice type
-		var isCandidate bool
+		var isAmountMatch bool
+		var amountDiff int64
+		
 		if invoice.Type == "PAYABLE" {
 			// For payables, we expect negative bank amounts (outgoing payments)
-			// Match absolute values since we're paying out
+			// Consider that payables are negative in bank
 			expectedAmountCents := -invoiceAmountCents
 			if transactionAmountCents < 0 {
-				diff := int64(math.Abs(float64(transactionAmountCents - expectedAmountCents)))
-				isCandidate = diff <= tolerance
+				amountDiff = int64(math.Abs(float64(transactionAmountCents - expectedAmountCents)))
+				isAmountMatch = amountDiff <= tolerance
 			}
 		} else if invoice.Type == "RECEIVABLE" {
 			// For receivables, we expect positive bank amounts (incoming payments)
 			expectedAmountCents := invoiceAmountCents
 			if transactionAmountCents > 0 {
-				diff := int64(math.Abs(float64(transactionAmountCents - expectedAmountCents)))
-				isCandidate = diff <= tolerance
+				amountDiff = int64(math.Abs(float64(transactionAmountCents - expectedAmountCents)))
+				isAmountMatch = amountDiff <= tolerance
 			}
 		}
 		
-		if isCandidate {
-			candidates = append(candidates, TransactionCandidate{
+		if isAmountMatch {
+			// Calculate date difference (prioritize transactions within 30 days of invoice date)
+			daysDiff := int(math.Abs(transaction.Date.Sub(invoice.Date).Hours() / 24))
+			
+			// Calculate score: amount precision (90%) + date proximity (10%)
+			amountPrecision := 1.0 - (float64(amountDiff) / float64(tolerance))
+			if amountPrecision < 0 {
+				amountPrecision = 0
+			}
+			
+			dateScore := 1.0
+			if daysDiff > 30 {
+				// Penalize transactions more than 30 days away
+				dateScore = math.Max(0.1, 1.0 - float64(daysDiff-30)/365.0)
+			} else {
+				// Bonus for transactions within 30 days
+				dateScore = 1.0 - float64(daysDiff)/30.0*0.3
+			}
+			
+			score := amountPrecision*0.9 + dateScore*0.1
+			
+			candidate := TransactionCandidate{
 				Transaction:   transaction,
 				OriginalIndex: i,
-			})
+				Score:         score,
+				DaysDiff:      daysDiff,
+			}
+			
+			candidates = append(candidates, candidate)
 			
 			s.log.Debug().
 				Float64("transaction_amount", transaction.Amount).
 				Str("transaction_counterparty", transaction.CounterParty).
-				Str("transaction_description", transaction.Description).
 				Time("transaction_date", transaction.Date).
-				Msg("Added candidate transaction")
+				Int("days_diff", daysDiff).
+				Float64("score", score).
+				Float64("amount_precision", amountPrecision).
+				Float64("date_score", dateScore).
+				Msg("Added candidate transaction with scoring")
 		}
+	}
+	
+	// Sort candidates by score (highest first) and limit to max 10
+	sort.Slice(candidates, func(i, j int) bool {
+		return candidates[i].Score > candidates[j].Score
+	})
+	
+	// Limit to top 10 candidates per invoice
+	maxCandidates := 10
+	if len(candidates) > maxCandidates {
+		s.log.Debug().
+			Int("total_candidates", len(candidates)).
+			Int("kept_candidates", maxCandidates).
+			Msg("Limiting candidates to top 10 by score")
+		candidates = candidates[:maxCandidates]
+	}
+	
+	// Log the final candidate selection
+	if len(candidates) > 0 {
+		s.log.Debug().
+			Int("final_candidates", len(candidates)).
+			Float64("best_score", candidates[0].Score).
+			Int("best_days_diff", candidates[0].DaysDiff).
+			Time("best_transaction_date", candidates[0].Transaction.Date).
+			Msg("Candidate selection completed")
 	}
 	
 	return candidates
