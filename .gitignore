@@ -53,3 +53,5 @@ vendor/
 # Go module proxy cache
 GOPROXY=direct
 GOSUMDB=off
+
+test-batch/
