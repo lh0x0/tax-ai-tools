@@ -6,9 +6,11 @@ import (
 	"os"
 	"time"
 
+	"github.com/sashabaranov/go-openai"
 	"github.com/spf13/cobra"
 	"tools/internal/logger"
 	"tools/internal/reconciliation"
+	"tools/internal/reconciliation/services"
 	"tools/internal/sheets"
 )
 
@@ -74,6 +76,11 @@ func runReconcile(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("GOOGLE_SHEET_URL environment variable is required")
 	}
 
+	openaiAPIKey := os.Getenv("OPENAI_API_KEY")
+	if openaiAPIKey == "" {
+		return fmt.Errorf("OPENAI_API_KEY environment variable is required")
+	}
+
 	log.Info().
 		Str("cutoff_date", cutoffDate.Format("2006-01-02")).
 		Bool("dry_run", dryRun).
@@ -100,11 +107,17 @@ func runReconcile(cmd *cobra.Command, args []string) error {
 
 	log.Info().Strs("sheets", requiredSheets).Msg("All required sheets validated")
 
+	// Initialize OpenAI client
+	openaiClient := openai.NewClient(openaiAPIKey)
+
 	// Initialize data reader
 	dataReader := reconciliation.NewDataReader(sheetsService)
 
+	// Initialize reconciliation service
+	reconciliationService := services.NewChatGPTReconciliationService(openaiClient)
+
 	// Read and process data
-	if err := processReconciliation(ctx, dataReader, cutoffDate, batchSize, dryRun); err != nil {
+	if err := processReconciliation(ctx, dataReader, reconciliationService, cutoffDate, batchSize, dryRun); err != nil {
 		return fmt.Errorf("reconciliation processing failed: %w", err)
 	}
 
@@ -135,7 +148,7 @@ func validateSheetsExist(ctx context.Context, sheetsService *sheets.Service, req
 }
 
 // processReconciliation performs the main reconciliation logic
-func processReconciliation(ctx context.Context, dataReader *reconciliation.DataReader, cutoffDate time.Time, batchSize int, dryRun bool) error {
+func processReconciliation(ctx context.Context, dataReader *reconciliation.DataReader, reconciliationService services.ReconciliationService, cutoffDate time.Time, batchSize int, dryRun bool) error {
 	const op = "processReconciliation"
 	log := logger.WithComponent("reconcile-process")
 
@@ -166,54 +179,57 @@ func processReconciliation(ctx context.Context, dataReader *reconciliation.DataR
 	}
 	log.Info().Int("receivable_invoices", len(receivableInvoices)).Msg("Receivable invoices read successfully")
 
-	// Create reconciliation data structure
-	data := reconciliation.ReconciliationData{
-		BankTransactions:   bankTransactions,
-		PayableInvoices:    payableInvoices,
-		ReceivableInvoices: receivableInvoices,
+	// Combine all invoices for processing
+	allInvoices := append(payableInvoices, receivableInvoices...)
+
+	// Perform ChatGPT-based reconciliation
+	result, err := reconciliationService.ReconcileAll(ctx, allInvoices, bankTransactions, cutoffDate)
+	if err != nil {
+		return fmt.Errorf("%s: failed to perform reconciliation: %w", op, err)
 	}
 
-	// Process reconciliation
-	if err := performReconciliation(data, cutoffDate, batchSize, dryRun); err != nil {
-		return fmt.Errorf("%s: failed to perform reconciliation: %w", op, err)
+	// Display reconciliation results
+	displayReconciliationResults(result, dryRun)
+
+	if !dryRun {
+		log.Info().Msg("TODO: Create output sheets with reconciliation results")
 	}
 
 	return nil
 }
 
-
-// performReconciliation performs the actual reconciliation logic
-func performReconciliation(
-	data reconciliation.ReconciliationData,
-	cutoffDate time.Time,
-	batchSize int,
-	dryRun bool,
-) error {
-	const op = "performReconciliation"
-	log := logger.WithComponent("reconcile-engine")
+// displayReconciliationResults displays the results of the reconciliation process
+func displayReconciliationResults(result *services.ReconciliationResult, dryRun bool) {
+	log := logger.WithComponent("reconcile-results")
 
 	log.Info().
-		Int("bank_transactions", len(data.BankTransactions)).
-		Int("payable_invoices", len(data.PayableInvoices)).
-		Int("receivable_invoices", len(data.ReceivableInvoices)).
-		Str("cutoff_date", cutoffDate.Format("2006-01-02")).
-		Int("batch_size", batchSize).
-		Bool("dry_run", dryRun).
-		Msg("Starting reconciliation analysis")
+		Int("total_invoices", result.TotalInvoices).
+		Int("total_transactions", result.TotalTransactions).
+		Int("matched_invoices", result.MatchedCount).
+		Int("unmatched_invoices", len(result.UnmatchedInvoices)).
+		Int("unmatched_transactions", len(result.UnmatchedTransactions)).
+		Dur("processing_time", result.ProcessingTime).
+		Msg("Reconciliation completed")
 
-	// TODO: Implement actual reconciliation logic
-	// - Match transactions with invoices
-	// - Apply cutoff date filtering
-	// - Process in batches
-	// - Generate reconciliation report
+	// Calculate match rate
+	matchRate := float64(result.MatchedCount) / float64(result.TotalInvoices) * 100
 
-	log.Info().Msg("Reconciliation analysis completed (placeholder)")
+	log.Info().
+		Float64("match_rate_percent", matchRate).
+		Msg("Match rate calculated")
+
+	// Log some examples of matches if available
+	if len(result.MatchedInvoices) > 0 && len(result.MatchedInvoices) <= 5 {
+		log.Info().
+			Interface("matched_pairs", result.MatchedInvoices).
+			Msg("Matched invoice-transaction pairs")
+	} else if len(result.MatchedInvoices) > 5 {
+		log.Info().
+			Int("total_matches", len(result.MatchedInvoices)).
+			Msg("Multiple matches found - showing count only")
+	}
 
 	if dryRun {
 		log.Info().Msg("Dry run mode: No output sheets created")
-	} else {
-		log.Info().Msg("TODO: Create output sheets with reconciliation results")
 	}
-
-	return nil
 }
