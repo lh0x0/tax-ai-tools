@@ -246,7 +246,7 @@ func (p *DocumentAIInvoiceProcessor) extractInvoiceData(doc *documentaipb.Docume
 			}
 		case "currency":
 			if value != "" {
-				invoice.Currency = strings.ToUpper(value)
+				invoice.Currency = p.normalizeCurrency(value)
 			}
 		case "purchase_order", "reference_number":
 			invoice.Reference = value
@@ -384,8 +384,9 @@ func (p *DocumentAIInvoiceProcessor) validateInvoice(invoice *models.Invoice) er
 	if invoice.InvoiceNumber == "" && invoice.ID == "" {
 		return NewValidationError("invoice_number", "", "invoice number is required")
 	}
-	if invoice.GrossAmount <= 0 && invoice.NetAmount <= 0 {
-		return NewValidationError("amount", invoice.GrossAmount, "invoice amount must be positive")
+	// Allow zero amounts for credit notes, refunds, or corrective invoices
+	if invoice.GrossAmount < 0 && invoice.NetAmount < 0 {
+		return NewValidationError("amount", invoice.GrossAmount, "invoice amount cannot be negative")
 	}
 	return nil
 }
@@ -406,4 +407,35 @@ func (p *DocumentAIInvoiceProcessor) Close() error {
 		return p.client.Close()
 	}
 	return nil
+}
+
+// normalizeCurrency standardizes currency codes to consistent format
+func (p *DocumentAIInvoiceProcessor) normalizeCurrency(currency string) string {
+	if currency == "" {
+		return "EUR" // Default to EUR for German invoices
+	}
+	
+	// Convert to uppercase and trim
+	normalized := strings.ToUpper(strings.TrimSpace(currency))
+	
+	// Common currency mappings to standard ISO codes
+	switch normalized {
+	case "€", "EURO", "EUROS", "EUR":
+		return "EUR"
+	case "$", "DOLLAR", "DOLLARS", "USD", "US$":
+		return "USD" 
+	case "£", "POUND", "POUNDS", "GBP":
+		return "GBP"
+	case "¥", "YEN", "JPY":
+		return "JPY"
+	case "CHF", "FRANKEN", "SWISS FRANC":
+		return "CHF"
+	default:
+		// If it's already a 3-letter code, return as-is
+		if len(normalized) == 3 {
+			return normalized
+		}
+		// Otherwise default to EUR
+		return "EUR"
+	}
 }

@@ -418,9 +418,12 @@ Company Context:
 - Our company: %s
 - Aliases: %s
 
-Return ONLY valid JSON with the requested fields. Use null for missing values.
-Amounts should be in the original currency format (e.g., "580.00" for 580 euros).
-Dates should be in YYYY-MM-DD format.`,
+IMPORTANT: Return ONLY valid JSON with NO trailing commas. 
+- Use null for missing values
+- Amounts should be in the original currency format (e.g., "580.00" for 580 euros)
+- Dates should be in YYYY-MM-DD format
+- Ensure the JSON is perfectly formatted with no syntax errors
+- Do NOT add a trailing comma after the last field`,
 		s.config.CompanyName,
 		s.config.CompanyName,
 		strings.Join(s.config.CompanyAliases, ", "))
@@ -491,7 +494,8 @@ func (s *DefaultInvoiceCompletionService) buildCompletionPrompt(ocrText string, 
 		}
 	}
 
-	prompt.WriteString("}")
+	prompt.WriteString("}\n\n")
+	prompt.WriteString("CRITICAL: Ensure the JSON has NO trailing comma after the last field. Check your JSON syntax carefully!")
 
 	return prompt.String()
 }
@@ -584,7 +588,7 @@ func (s *DefaultInvoiceCompletionService) mergeCompletionResults(invoice *models
 
 	// Currency
 	if contains(missingFields, "currency") && response.Currency != "" {
-		invoice.Currency = strings.ToUpper(response.Currency)
+		invoice.Currency = s.normalizeCurrency(response.Currency)
 		confidence["currency"] = 0.9
 	}
 
@@ -615,20 +619,38 @@ func (s *DefaultInvoiceCompletionService) mergeCompletionResults(invoice *models
 	return nil
 }
 
-// parseAmount parses amount string handling European format
+// parseAmount parses amount string handling both German and English formats
 func (s *DefaultInvoiceCompletionService) parseAmount(amountStr string) (int64, error) {
 	// Clean the amount string
 	cleaned := strings.TrimSpace(amountStr)
-	cleaned = strings.ReplaceAll(cleaned, ",", ".")
 	cleaned = strings.ReplaceAll(cleaned, " ", "")
 	cleaned = strings.ReplaceAll(cleaned, "€", "")
 	cleaned = strings.ReplaceAll(cleaned, "$", "")
 	cleaned = strings.ReplaceAll(cleaned, "EUR", "")
 	cleaned = strings.ReplaceAll(cleaned, "USD", "")
+	
+	// Handle German number format (7.303,08 -> 7303.08)
+	if strings.Contains(cleaned, ",") {
+		// If there's both . and , assume German format (. = thousands, , = decimal)
+		if strings.Contains(cleaned, ".") && strings.Contains(cleaned, ",") {
+			// Remove thousands separators (dots)
+			cleaned = strings.ReplaceAll(cleaned, ".", "")
+			// Replace decimal separator (comma) with dot
+			cleaned = strings.ReplaceAll(cleaned, ",", ".")
+		} else if strings.Contains(cleaned, ",") {
+			// Only comma, could be decimal separator
+			// Count digits after comma to determine if it's decimal
+			parts := strings.Split(cleaned, ",")
+			if len(parts) == 2 && len(parts[1]) <= 2 {
+				// Likely decimal separator (e.g., "1234,50")
+				cleaned = strings.ReplaceAll(cleaned, ",", ".")
+			}
+		}
+	}
 
 	amount, err := strconv.ParseFloat(cleaned, 64)
 	if err != nil {
-		return 0, fmt.Errorf("unable to parse amount: %s", amountStr)
+		return 0, fmt.Errorf("unable to parse amount: %s (cleaned: %s)", amountStr, cleaned)
 	}
 
 	return int64(amount * 100), nil
@@ -685,6 +707,7 @@ func contains(slice []string, item string) bool {
 	return false
 }
 
+
 // getString safely extracts a string value from a map[string]interface{}
 func getString(m map[string]interface{}, key string) string {
 	if value, exists := m[key]; exists && value != nil {
@@ -693,6 +716,37 @@ func getString(m map[string]interface{}, key string) string {
 		}
 	}
 	return ""
+}
+
+// normalizeCurrency standardizes currency codes to consistent format
+func (s *DefaultInvoiceCompletionService) normalizeCurrency(currency string) string {
+	if currency == "" {
+		return "EUR" // Default to EUR for German invoices
+	}
+	
+	// Convert to uppercase and trim
+	normalized := strings.ToUpper(strings.TrimSpace(currency))
+	
+	// Common currency mappings to standard ISO codes
+	switch normalized {
+	case "€", "EURO", "EUROS", "EUR":
+		return "EUR"
+	case "$", "DOLLAR", "DOLLARS", "USD", "US$":
+		return "USD" 
+	case "£", "POUND", "POUNDS", "GBP":
+		return "GBP"
+	case "¥", "YEN", "JPY":
+		return "JPY"
+	case "CHF", "FRANKEN", "SWISS FRANC":
+		return "CHF"
+	default:
+		// If it's already a 3-letter code, return as-is
+		if len(normalized) == 3 {
+			return normalized
+		}
+		// Otherwise default to EUR
+		return "EUR"
+	}
 }
 
 // Helper functions for environment parsing

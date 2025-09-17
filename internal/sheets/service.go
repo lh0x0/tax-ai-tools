@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"regexp"
+	"strings"
 	"time"
 
 	"github.com/rs/zerolog"
@@ -183,7 +184,7 @@ func (s *Service) convertResultsToRows(results []BatchResult) ([]BatchRow, error
 		// Fill invoice data
 		if result.Invoice != nil {
 			row.InvoiceNumber = result.Invoice.InvoiceNumber
-			row.Currency = result.Invoice.Currency
+			row.Currency = s.normalizeCurrency(result.Invoice.Currency)
 			row.NetAmount = float64(result.Invoice.NetAmount) / 100
 			row.VATAmount = float64(result.Invoice.VATAmount) / 100
 			row.GrossAmount = float64(result.Invoice.GrossAmount) / 100
@@ -377,4 +378,35 @@ func (s *Service) formatHeaders(ctx context.Context, sheetID int64, sheetName st
 	}
 
 	return nil
+}
+
+// normalizeCurrency standardizes currency codes to consistent format
+func (s *Service) normalizeCurrency(currency string) string {
+	if currency == "" {
+		return "EUR" // Default to EUR for German invoices
+	}
+	
+	// Convert to uppercase and trim
+	normalized := strings.ToUpper(strings.TrimSpace(currency))
+	
+	// Common currency mappings to standard ISO codes
+	switch normalized {
+	case "€", "EURO", "EUROS", "EUR":
+		return "EUR"
+	case "$", "DOLLAR", "DOLLARS", "USD", "US$":
+		return "USD" 
+	case "£", "POUND", "POUNDS", "GBP":
+		return "GBP"
+	case "¥", "YEN", "JPY":
+		return "JPY"
+	case "CHF", "FRANKEN", "SWISS FRANC":
+		return "CHF"
+	default:
+		// If it's already a 3-letter code, return as-is
+		if len(normalized) == 3 {
+			return normalized
+		}
+		// Otherwise default to EUR
+		return "EUR"
+	}
 }

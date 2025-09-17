@@ -259,7 +259,11 @@ func (s *SKR03BookingService) generateBookingWithChatGPT(ctx context.Context, in
 	// Parse JSON response
 	var bookingResponse ChatGPTBookingResponse
 	if err := json.Unmarshal([]byte(content), &bookingResponse); err != nil {
-		return nil, fmt.Errorf("%s: failed to parse ChatGPT JSON response: %w", op, err)
+		s.log.Error().
+			Err(err).
+			Str("response", content).
+			Msg("Failed to parse ChatGPT JSON response")
+		return nil, fmt.Errorf("%s: failed to parse ChatGPT JSON response: %w (response: %s)", op, err, content)
 	}
 
 	// Validate required fields
@@ -307,7 +311,11 @@ STEUERSCHLÜSSEL:
 - 5: 7% Vorsteuer
 - 2: 7% Umsatzsteuer
 
-Antworte IMMER als valides JSON.`
+CRITICAL: Antworte AUSSCHLIESSLICH mit gültigem JSON. Kein Text vor oder nach dem JSON.
+- Keine Erklärungen außerhalb des JSON
+- Keine Markdown-Formatierung
+- Keine trailing commas
+- Validiere die JSON-Syntax bevor du antwortest`
 }
 
 // buildBookingPrompt creates the user prompt for ChatGPT
@@ -342,7 +350,8 @@ func (s *SKR03BookingService) buildBookingPrompt(invoiceJSON string, invoice *mo
 	prompt.WriteString(`  "begruendung_sollkonto": "Warum wurde dieses Sollkonto gewählt",` + "\n")
 	prompt.WriteString(`  "begruendung_habenkonto": "Warum wurde dieses Habenkonto gewählt",` + "\n")
 	prompt.WriteString(`  "begruendung_steuer": "Warum wurde dieser Steuerschlüssel gewählt"` + "\n")
-	prompt.WriteString("}")
+	prompt.WriteString("}\n\n")
+	prompt.WriteString("WICHTIG: Antworte NUR mit dem JSON-Object. Keine zusätzlichen Texte oder Erklärungen!")
 
 	return prompt.String()
 }
